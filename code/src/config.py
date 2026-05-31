@@ -26,7 +26,7 @@ config = {
 
     # 训练策略
     'warmup_epochs': 5,
-    'weight_decay': 2e-4,
+    'weight_decay': 3e-4,
     'swa_start_ratio': 0.7,
 
     'output_dir': os.path.join(project_root, 'model', f'{sequence_length}_{feature_num}'),

@@ -720,6 +720,10 @@ def main():
     swa_model = AveragedModel(model)
     swa_scheduler = SWALR(optimizer, swa_lr=5e-6)
 
+    use_swa = False  # 禁用 SWA，直接用原始模型
+    patience = 10
+    no_improve = 0
+
     if is_train:
         best_score = -float('inf')
         best_epoch = -1
@@ -729,29 +733,18 @@ def main():
 
             train_loss, train_metrics = train_ranking_model(
                 model, train_loader, criterion, optimizer, device, epoch, writer,
-                scheduler=None if epoch < warmup_epochs else None
+                scheduler=None if epoch >= warmup_epochs else scheduler
             )
 
             print(f"Train Loss: {train_loss:.4f}")
             for k, v in train_metrics.items():
                 print(f"Train {k}: {v:.4f}")
 
-            if epoch >= swa_start:
-                swa_model.update_parameters(model)
-                swa_scheduler.step()
-                if writer:
-                    writer.add_scalar('train/learning_rate', swa_scheduler.get_last_lr()[0], epoch)
-                eval_model = swa_model.module
-            else:
-                if epoch < warmup_epochs:
-                    for _ in range(len(train_loader)):
-                        scheduler.step()
-                if writer:
-                    writer.add_scalar('train/learning_rate', scheduler.get_last_lr()[0], epoch)
-                eval_model = model
+            if writer:
+                writer.add_scalar('train/learning_rate', scheduler.get_last_lr()[0], epoch)
 
             eval_loss, eval_metrics = evaluate_ranking_model(
-                eval_model, val_loader, criterion, device, writer, epoch
+                model, val_loader, criterion, device, writer, epoch
             )
 
             print(f"Eval Loss: {eval_loss:.4f}")
@@ -762,8 +755,14 @@ def main():
             if current_final_score > best_score:
                 best_score = current_final_score
                 best_epoch = epoch + 1
-                torch.save(eval_model.state_dict(), os.path.join(output_dir, 'best_model.pth'))
-                print(f"保存最佳模型 - final score: {best_score:.4f} (SWA: {epoch >= swa_start})")
+                torch.save(model.state_dict(), os.path.join(output_dir, 'best_model.pth'))
+                print(f"保存最佳模型 - final score: {best_score:.4f}")
+                no_improve = 0
+            else:
+                no_improve += 1
+                if no_improve >= patience:
+                    print(f"Early stopping at epoch {epoch + 1}, no improvement for {patience} epochs")
+                    break
 
         print(f"\n训练完成！最佳 epoch: {best_epoch}, 最佳 final score: {best_score:.4f}")
         with open(os.path.join(output_dir, 'final_score.txt'), 'w') as f:
