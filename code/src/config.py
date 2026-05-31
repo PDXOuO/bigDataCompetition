@@ -7,10 +7,10 @@ feature_num = '158+39'
 
 config = {
     'sequence_length': sequence_length,
-    'd_model': 256,
-    'nhead': 8,
-    'num_layers': 3,
-    'dim_feedforward': 512,
+    'd_model': 192,
+    'nhead': 6,
+    'num_layers': 2,
+    'dim_feedforward': 384,
     'batch_size': 4,
     'num_epochs': 50,
     'learning_rate': 3e-5,
@@ -26,7 +26,7 @@ config = {
 
     # 训练策略
     'warmup_epochs': 5,
-    'weight_decay': 5e-5,
+    'weight_decay': 2e-4,
     'swa_start_ratio': 0.7,
 
     'output_dir': os.path.join(project_root, 'model', f'{sequence_length}_{feature_num}'),

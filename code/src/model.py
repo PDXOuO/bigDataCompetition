@@ -18,6 +18,30 @@ class LearnablePositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
+class MarketContextEncoder(nn.Module):
+    """市场上下文编码器 - 学习市场整体状态作为条件"""
+
+    def __init__(self, d_model, dropout=0.1):
+        super().__init__()
+        self.market_encoder = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.LayerNorm(d_model // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, d_model)
+        )
+        self.gate = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.Sigmoid()
+        )
+
+    def forward(self, stock_features):
+        market_feature = stock_features.mean(dim=1, keepdim=True)
+        market_encoding = self.market_encoder(market_feature)
+        gate = self.gate(torch.cat([stock_features, market_encoding.expand_as(stock_features)], dim=-1))
+        return stock_features + gate * market_encoding
+
+
 class TemporalCNNBlock(nn.Module):
     """提取局部微观形态的 1D-CNN 残差块"""
 
@@ -205,6 +229,7 @@ class StockTransformer(nn.Module):
         )
         self.temporal_encoder = nn.TransformerEncoder(encoder_layer, num_layers=config['num_layers'])
 
+        self.market_context = MarketContextEncoder(config['d_model'], config['dropout'])
         self.temporal_pooling = TemporalAttentionPooling(config['d_model'], config['dropout'])
         self.feature_attention = FeatureAttention(config['d_model'], config['dropout'])
         self.cross_stock_attention = CrossStockAttention(config['d_model'], config['nhead'], config['dropout'])
@@ -257,6 +282,7 @@ class StockTransformer(nn.Module):
         stock_features = pooled_features.view(batch_size, num_stocks, -1)
 
         interactive_features = self.cross_stock_attention(stock_features, attn_mask=stock_adj_mask)
+        interactive_features = self.market_context(interactive_features)
 
         interactive_features = interactive_features.view(batch_size * num_stocks, -1)
 

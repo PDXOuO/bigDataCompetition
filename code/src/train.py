@@ -23,7 +23,7 @@ def set_seed(seed=42):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.determiniFstic = True
     torch.backends.cudnn.benchmark = False
     os.environ['PYTHONHASHSEED'] = str(seed)
 
@@ -265,14 +265,11 @@ class ImprovedRankingLoss(nn.Module):
     def ndcg_at_k(self, pred_scores, true_relevance, k=None):
         if k is None:
             k = len(pred_scores)
-
         _, sorted_indices = torch.sort(pred_scores, descending=True)
         sorted_rel = true_relevance[sorted_indices]
-
         ideal, _ = torch.sort(true_relevance, descending=True)
         dcg = self.dcg_at_k(sorted_rel, k)
         idcg = self.dcg_at_k(ideal, k)
-
         ndcg = dcg / (idcg + 1e-8)
         return ndcg
 
@@ -300,11 +297,9 @@ class ImprovedRankingLoss(nn.Module):
         true_mean = y_true.mean(dim=1, keepdim=True)
         pred_centered = y_pred - pred_mean
         true_centered = y_true - true_mean
-
         cov = (pred_centered * true_centered).sum(dim=1)
         pred_var = torch.sqrt((pred_centered ** 2).sum(dim=1) + eps)
         true_var = torch.sqrt((true_centered ** 2).sum(dim=1) + eps)
-
         ic = cov / (pred_var * true_var)
         return 1.0 - ic.mean()
 
@@ -319,18 +314,14 @@ class ImprovedRankingLoss(nn.Module):
     def forward(self, y_pred, y_true):
         batch_size, num_items = y_true.size()
         k = min(self.k, num_items)
-
         _, top_indices = torch.topk(y_true, k, dim=1)
-
         weights = torch.full_like(y_true, fill_value=self.base_weight)
         for i in range(batch_size):
             weights[i, top_indices[i]] = self.weight_factor
-
         listwise = self.listwise_loss(y_pred, y_true, weights)
         pairwise = self.pairwise_loss(y_pred, y_true, weights)
         ic = self.ic_loss(y_pred, y_true)
         ndcg = self.ndcg_loss(y_pred, y_true)
-
         total_loss = listwise + (self.pairwise_weight * pairwise) + (self.ic_weight * ic) + (self.ndcg_weight * ndcg)
         return total_loss
 
@@ -738,7 +729,7 @@ def main():
 
             train_loss, train_metrics = train_ranking_model(
                 model, train_loader, criterion, optimizer, device, epoch, writer,
-                scheduler=None if epoch >= warmup_epochs else scheduler
+                scheduler=None if epoch < warmup_epochs else None
             )
 
             print(f"Train Loss: {train_loss:.4f}")
