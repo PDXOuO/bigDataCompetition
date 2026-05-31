@@ -8,6 +8,7 @@ from tqdm import tqdm
 from tensorboardX import SummaryWriter
 from config import config
 from model import StockTransformer
+from model_lite import StockRankingNet, RankingLossWithLabelSmoothing
 from utils import engineer_features_39, engineer_features_158plus39
 from utils import create_ranking_dataset_vectorized
 import os
@@ -15,6 +16,8 @@ import json
 import multiprocessing as mp
 import random
 from torch.optim.swa_utils import AveragedModel, SWALR
+
+USE_LITE_MODEL = False  # 设置为 False 使用原来的 Transformer 模型
 
 
 def set_seed(seed=42):
@@ -112,6 +115,133 @@ def preprocess_data(df, is_train=True, stockid2idx=None):
 
 def preprocess_val_data(df, stockid2idx=None):
     return _preprocess_common(df, stockid2idx, desc="验证数据特征工程", drop_small_open=True)
+
+
+class ListMLELoss(nn.Module):
+    """ListMLE 损失 - 专门为排序设计的损失函数"""
+
+    def __init__(self, temperature=1.0):
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(self, y_pred, y_true):
+        batch_size, num_items = y_true.size()
+        device = y_pred.device
+
+        sorted_indices = torch.argsort(y_true, dim=1, descending=True)
+        y_pred_sorted = torch.gather(y_pred, 1, sorted_indices)
+
+        listmle = torch.zeros(batch_size, device=device)
+        for i in range(batch_size):
+            valid_items = num_items
+            for j in range(valid_items - 1):
+                denom = torch.logsumexp(y_pred_sorted[i, j:] / self.temperature, dim=0)
+                listmle[i] += y_pred_sorted[i, j] / self.temperature - denom
+
+        return listmle.mean()
+
+
+class LambdaRankLoss(nn.Module):
+    """LambdaRank 损失 - 结合 NDCG 梯度的排序损失"""
+
+    def __init__(self, k=5, ndcg_weight=2.0, listwise_weight=1.0):
+        super().__init__()
+        self.k = k
+        self.ndcg_weight = ndcg_weight
+        self.listwise_weight = listwise_weight
+
+    def dcg_at_k(self, rel, k=None):
+        if k is None:
+            k = len(rel)
+        rel = rel[:k]
+        discounts = torch.log2(torch.arange(2, len(rel) + 2, device=rel.device, dtype=torch.float32))
+        return torch.sum(rel / discounts)
+
+    def ndcg_at_k(self, y_pred, y_true, k=None):
+        if k is None:
+            k = len(y_pred)
+        k = min(k, len(y_pred))
+
+        _, sorted_indices = torch.sort(y_pred, descending=True)
+        sorted_rel = y_true[sorted_indices[:k]]
+
+        ideal, _ = torch.sort(y_true, descending=True)
+        ideal_rel = ideal[:k]
+
+        dcg = self.dcg_at_k(sorted_rel, k)
+        idcg = self.dcg_at_k(ideal_rel, k)
+
+        return dcg / (idcg + 1e-8)
+
+    def listwise_loss(self, y_pred, y_true):
+        log_probs = F.log_softmax(y_pred, dim=1)
+        normalized_true = (y_true - y_true.mean(dim=1, keepdim=True)) / (y_true.std(dim=1, keepdim=True) + 1e-8)
+        normalized_true = torch.sigmoid(normalized_true)
+        loss = -(normalized_true * log_probs).sum(dim=1)
+        return loss.mean()
+
+    def forward(self, y_pred, y_true):
+        ndcg_loss = 0.0
+        batch_size = y_pred.size(0)
+        for i in range(batch_size):
+            ndcg = self.ndcg_at_k(y_pred[i], y_true[i], k=self.k)
+            ndcg_loss += (1.0 - ndcg)
+
+        ndcg_loss = ndcg_loss / batch_size
+        listwise = self.listwise_weight * self.listwise_loss(y_pred, y_true)
+
+        return self.ndcg_weight * ndcg_loss + listwise
+
+
+class CombinedRankingLoss(nn.Module):
+    """组合排序损失 - ListMLE + LambdaRank + IC + Pairwise"""
+
+    def __init__(self, temperature=1.0, k=5,
+                 listmle_weight=1.0, lambdarank_weight=2.0,
+                 pairwise_weight=1.0, ic_weight=3.0):
+        super().__init__()
+        self.temperature = temperature
+        self.k = k
+        self.listmle_weight = listmle_weight
+        self.lambdarank_weight = lambdarank_weight
+        self.pairwise_weight = pairwise_weight
+        self.ic_weight = ic_weight
+
+        self.listmle = ListMLELoss(temperature=temperature)
+        self.lambdarank = LambdaRankLoss(k=k, ndcg_weight=1.0, listwise_weight=0.5)
+
+    def ic_loss(self, y_pred, y_true, eps=1e-8):
+        pred_mean = y_pred.mean(dim=1, keepdim=True)
+        true_mean = y_true.mean(dim=1, keepdim=True)
+        pred_centered = y_pred - pred_mean
+        true_centered = y_true - true_mean
+        cov = (pred_centered * true_centered).sum(dim=1)
+        pred_var = torch.sqrt((pred_centered ** 2).sum(dim=1) + eps)
+        true_var = torch.sqrt((true_centered ** 2).sum(dim=1) + eps)
+        ic = cov / (pred_var * true_var)
+        return 1.0 - ic.mean()
+
+    def pairwise_loss(self, y_pred, y_true):
+        batch_size, num_items = y_pred.size()
+        pred_diff = y_pred.unsqueeze(2) - y_pred.unsqueeze(1)
+        true_diff = y_true.unsqueeze(2) - y_true.unsqueeze(1)
+        mask = (true_diff != 0).float()
+        pairwise_loss = torch.sigmoid(-pred_diff * torch.sign(true_diff))
+        num_pairs = mask.sum(dim=[1, 2]).clamp(min=1)
+        loss = (pairwise_loss * mask).sum(dim=[1, 2]) / num_pairs
+        return loss.mean()
+
+    def forward(self, y_pred, y_true):
+        listmle_loss = self.listmle(y_pred, y_true)
+        lambdarank_loss = self.lambdarank(y_pred, y_true)
+        ic_loss = self.ic_loss(y_pred, y_true)
+        pairwise = self.pairwise_loss(y_pred, y_true)
+
+        total = (self.listmle_weight * listmle_loss +
+                 self.lambdarank_weight * lambdarank_loss +
+                 self.ic_weight * ic_loss +
+                 self.pairwise_weight * pairwise)
+        return total
 
 
 class ImprovedRankingLoss(nn.Module):
@@ -580,20 +710,28 @@ def main():
         collate_fn=collate_fn, num_workers=0, pin_memory=False
     )
 
-    model = StockTransformer(input_dim=len(features), config=config, num_stocks=num_stocks)
+    if USE_LITE_MODEL:
+        model = StockRankingNet(input_dim=len(features), config=config, num_stocks=num_stocks)
+        criterion = RankingLossWithLabelSmoothing(
+            k=5,
+            ic_weight=config.get('ic_weight', 4.0),
+            pairwise_weight=config.get('pairwise_weight', 1.5),
+            smoothing=config.get('label_smoothing', 0.15)
+        )
+    else:
+        model = StockTransformer(input_dim=len(features), config=config, num_stocks=num_stocks)
+        criterion = ImprovedRankingLoss(
+            k=5, temperature=0.5, weight_factor=config['top5_weight'],
+            pairwise_weight=config['pairwise_weight'], base_weight=config.get('base_weight', 1.0),
+            ic_weight=config.get('ic_weight', 2.0), ndcg_weight=1.0
+        )
     model.to(device)
     print(f"模型参数量: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
-
-    criterion = ImprovedRankingLoss(
-        k=5, temperature=0.5, weight_factor=config['top5_weight'],
-        pairwise_weight=config['pairwise_weight'], base_weight=config.get('base_weight', 1.0),
-        ic_weight=config.get('ic_weight', 2.0), ndcg_weight=1.0
-    )
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config['learning_rate'],
-        weight_decay=config.get('weight_decay', 5e-5)
+        weight_decay=config.get('weight_decay', 2e-4)
     )
 
     warmup_epochs = config.get('warmup_epochs', 5)
