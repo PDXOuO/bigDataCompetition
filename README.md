@@ -1,148 +1,61 @@
-# THU-BigDataCompetition-2026-baseline
+# 代码说明
 
-本项目是一个面向沪深300成分股的**排序学习选股**方案：
-- 输入：每只股票过去一段时间（默认60个交易日）的量价与技术特征序列；
-- 模型：`StockTransformer`，同时建模单股票时序模式与股票间交互；
-- 输出：对同一天全部候选股票打分并排序，最终输出前5只股票（等权重0.2）。
+## 环境配置
+本项目基于 Docker 容器化运行，底层依赖由 `uv` 严格锁定以保证 100% 离线可复现。
+- 基础镜像：`python:3.12-slim-bookworm`
+- 核心依赖：`torch==2.2.0`, `pandas`, `numpy`, `TA-Lib`
+详细的依赖版本及其哈希值已固化在项目根目录的 `uv.lock` 文件中。
 
----
+## 数据
+使用了官方提供的沪深300公开训练数据，数据获取链接为 [请填入官方链接或开源链接]，在训练模型时挂载至 `/app/data` 目录使用。
 
-## 1. 项目目标与整体流程
+## 预训练模型
+本项目未使用外部预训练模型，所有网络权重均为基于训练数据从零开始端到端（End-to-End）训练得出。
 
-核心目标是学习“当天应优先持有哪些股票”的排序函数，而不是单只股票二分类。
+## 算法
+### 整体思路介绍
+本项目提出了一种针对沪深 300 选股任务的“极端目标导向”排序学习方案。有别于传统的二分类或数值回归，我们将选股视为一个 **Learning-to-Rank (LTR)** 任务，并敏锐地捕捉到了赛题 Metric（Top5 绝对收益求和）的核心导向。通过构建 1D-CNN 与 Transformer 混合的时空感知网络，并施加极其倾斜的 Top 5 损失权重，模型放弃了对全局标的的保守排序，化身为高弹性的“妖股狙击手”。
 
-训练与推理主流程如下：
-1. 读取历史行情数据（`data/stock_data.csv`）；
-2. 做特征工程（39特征或`158+39`特征）；
-3. 构建标签：未来收益率（代码中为 `open_t1` 到 `open_t5` 的相对收益）；
-4. 按“日期”组织排序样本：每个样本是一日内多只股票的序列与目标；
-5. 训练排序模型，监控 `final_score` 并保存最优权重；
-6. 使用训练好的 `best_model.pth` + `scaler.pkl` 在最新日期上生成Top5选股结果。
+### 方法的创新点
+1. **解除极值封印**：传统量化多因子模型常使用 MAD 去极值以保证梯度平稳，但这会抹杀模型对暴涨标的的感知。本项目移除了标签的去极值处理，仅对输入特征进行截面 Z-Score 截断，使模型直面真实的收益率极值。
+2. **目标函数极致对齐**：引入并大幅调高了 Top 5 加权损失（`top5_weight=10.0`），降低了全局相关性约束（`ic_weight=0.5`），强迫模型在 197 维的特征空间中，专注于对头部标的进行精准打分。
 
----
+### 网络结构
+模型主体为 `StockTransformer`，包含以下核心组件：
+- **TemporalCNNBlock (1D-CNN 残差块)**：作为低通滤波器，提取连续 3 天的局部微观量价形态，并过滤高频噪声。
+- **TransformerEncoder**：单层 64 维 Transformer，捕捉 60 个交易日内的宏观长程依赖，辅以 0.3 的高 Dropout 防止过拟合。
+- **Feature & Cross-Stock Attention**：对时间维度特征进行聚合后，利用自注意力机制在截面（同一交易日的候选股票池）上进行横向交互。
 
-## 2. 代码结构说明
+### 损失函数
+采用了高度定制化的 `WeightedRankingLoss`：
+- **Listwise Loss**：衡量预测分布与真实收益分布的全局差异。
+- **Pairwise Loss**：关注两两股票之间的相对排名正误。
+- **Rank IC Loss**：基于皮尔逊相关系数逼近模型截面得分与真实收益的秩相关性。
+通过给真实收益率排名前 5 的样本施加 10 倍的惩罚权重，引导模型聚焦头部标的。
 
-### [config.py](config.py)
-统一管理训练与推理参数，包括：
-- 序列长度 `sequence_length`（默认60）；
-- 模型超参数（`d_model`、`nhead`、`num_layers` 等）；
-- 训练超参数（`batch_size`、`num_epochs`、`learning_rate`）；
-- 排序损失权重参数（`pairwise_weight`、`top5_weight`、`base_weight`）；
-- 数据路径和输出路径（默认输出到 `output/`）。
+### 数据扩增
+利用多进程进行了时间序列的滑动窗口切分，将原始数据展开为密集的截面样本，有效增加了模型可见的市场切片数量。
 
-### [model.py](model.py)
-定义核心模型 `StockTransformer`，主要由以下模块组成：
-- `PositionalEncoding`：时序位置编码；
-- 时序编码器 `TransformerEncoder`：提取单股票历史序列表示；
-- `FeatureAttention`：对时间维特征做注意力聚合；
-- `CrossStockAttention`：在同一交易日内建模股票间关系；
-- `ranking_layers` + `score_head`：输出每只股票的排序分数。
+### 模型集成
+在训练后期引入了 **SWA (Stochastic Weight Averaging，随机权重平均)**，对最后阶段的震荡权重进行平滑，以提升模型在未知测试环境中的泛化能力。
 
-输入形状：`[batch, num_stocks, seq_len, feature_dim]`  
-输出形状：`[batch, num_stocks]`。
+### 算法的其他细节
+- **特征工程**：利用 TA-Lib 高效提取了 158 个 Alpha 因子与 39 个核心量价因子。
+- **防止未来函数**：摒弃了全局标准化，严格采用 `cross_sectional_zscore`（每日截面标准化），防止时间序列数据的宏观漂移与前后穿越。
 
-### [utils.py](utils.py)
-包含特征工程与数据集构建逻辑：
-- `engineer_features_39()`：39个技术指标特征；
-- `engineer_features()`：158个Alpha类特征；
-- `engineer_features_158plus39()`：合并 `158 + 39` 特征；
-- `create_ranking_dataset_vectorized()`：向量化构建按日排序样本（训练核心加速点）。
+## 训练流程
+入口脚本为 `train.py`。
+1. 使用多进程对股票数据进行 197 维特征的并行计算。
+2. 以日为单位构建排序样本，并生成有效 mask（处理每日股票停牌或数量不均问题）。
+3. 执行 Epoch 训练，实时计算验证集上的 `final_score` 预测模拟收益。
+4. 触发 SWA 权重更新，最终将验证集表现最好的权重保存为 `best_model.pth`。
 
-说明：特征工程使用了 `TA-Lib`，若未正确安装会报错。
+## 推理流程
+入口脚本为 `test.py`（原 predict.py）。
+1. 读取最新行情数据，截取每只股票过去 60 天的上下文。
+2. 执行与训练环境绝对一致的特征工程与每日截面 Z-Score 标准化。
+3. 加载 `best_model.pth` 进行前向传播，输出股票得分。
+4. 选取得分最高的 5 只股票，按固定权重 0.2 格式化输出至 `output/result.csv`。
 
-### [train.py](train.py)
-训练主脚本，关键内容：
-- 数据预处理：
-	- `_preprocess_common()`：按股票分组并行特征工程、股票ID映射、标签构建；
-	- `split_train_val_by_last_month()`：按最后阶段数据切分训练/验证集，并保留序列上下文。
-- 数据集组织：
-	- `RankingDataset` + `collate_fn`：处理每日股票数量不一致问题（padding + mask）。
-- 损失函数：`WeightedRankingLoss`
-	- 组合了 `listwise_loss` 与 `pairwise_loss`；
-	- 对真实Top-k样本施加更高权重。
-- 评估指标：`calculate_ranking_metrics()`
-	- 计算 `pred_return_sum`、`max_return_sum`、`ratio_pred`、`final_score` 等；
-	- 训练过程中以验证集 `final_score` 选择最优模型。
-
-训练产物：
-- `best_model.pth`：最佳模型参数；
-- `scaler.pkl`：标准化器；
-- `config.json`：训练时配置快照；
-- `final_score.txt`：最佳分数记录；
-- `log/`：TensorBoard日志。
-
-### [predict.py](predict.py)
-推理主脚本，流程：
-1. 加载历史数据，取最新交易日；
-2. 执行与训练一致的特征工程；
-3. 加载 `scaler.pkl` 进行特征标准化；
-4. 用 `best_model.pth` 对全部可预测股票打分；
-5. 按分数降序取前5只，输出到 `output.csv`：
-	 - `stock_id`
-	 - `weight`（固定 `0.2`）
-
-### [get_stock_data.py](get_stock_data.py)
-数据抓取脚本（Baostock）：
-- 获取沪深300成分股；
-- 抓取历史日线数据并保存为训练所需格式。
-
----
-
-## 3. 数据与输入输出约定
-
-默认训练数据文件：
-- `data/train.csv`
-
-关键列：
-- `股票代码`、`日期`、`开盘`、`收盘`、`最高`、`最低`、`成交量`、`成交额`、`换手率`、`涨跌幅` 等。
-
-预测输出文件：
-- output目录下 `result.csv`（由 `predict.py` 生成）。
-
----
-
-## 4. 运行方法（推荐使用 uv）
-
-1) 使用 `uv` 安装依赖
-
-`uv sync`
-
-2) 激活虚拟环境
-
-`source .venv/bin/activate`
-
-3) 训练模型
-
-```
-sh train.sh
-```
-
-4) 生成预测结果
-
-```
-sh test.sh
-```
-
----
-
-## 5. 常见问题
-
-1) `TA-Lib` 安装失败  
-本项目特征工程依赖 `TA-Lib`，需要先安装系统层面的 `ta-lib` 库，再安装Python包。
-```
-wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz && \
-    tar -xzf ta-lib-0.4.0-src.tar.gz && \
-    cd ta-lib && \
-    ./configure --prefix=/usr && \
-    make -j1 && \
-    make install && \
-    cd .. && \
-    rm -rf ta-lib ta-lib-0.4.0-src.tar.gz
-```
-
-2) 多进程相关问题  
-`train.py` 与 `predict.py` 均在入口使用了 `spawn` 模式，Linux/macOS下请保持通过脚本入口运行（不要在交互式环境里直接多进程调用主逻辑）。
-
-3) GPU/CPU自动选择  
-代码会按 `CUDA -> MPS -> CPU` 顺序自动选择设备；无GPU时可直接CPU运行。
+## 其他注意事项
+为验证模型泛化性，在训练前进行了时序切分，将最后一个月的数据作为验证集（Validation Set），同时保留了序列所需的历史上下文窗口。

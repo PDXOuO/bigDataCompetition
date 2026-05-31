@@ -525,73 +525,56 @@ def create_dataset(data, features, sequence_length, ranking_data_path=None):
     """保持原有接口，但内部调用新的排序数据集创建函数"""
     return create_ranking_dataset_multiprocess(data, features, sequence_length, ranking_data_path)
 
-def create_ranking_dataset_vectorized(data, features, sequence_length, ranking_data_path=None, min_window_end_date=None):
+
+def create_ranking_dataset_vectorized(data, features, sequence_length, ranking_data_path=None,
+                                      min_window_end_date=None):
     """
     向量化加速版本：预计算每只股票的所有滑动窗口，再按日期聚合。
-    保持与原函数完全相同的输出格式。
+    已修复跨周末/节假日导致样本被错误丢弃的致命 Bug。
     """
-    # if ranking_data_path and os.path.exists(ranking_data_path):
-    #     print(f"加载已有的排序数据集: {ranking_data_path}")
-    #     return joblib.load(ranking_data_path)
-
     print("正在创建排序数据集（向量化加速版本）...")
-    # data.rename(columns={'stock_idx': 'instrument'}, inplace=True)
     data = data.copy()
     data.rename(columns={'日期': 'datetime'}, inplace=True)
     data['datetime'] = pd.to_datetime(data['datetime'])
 
     # 1. 确保数据按股票和时间排序
     data = data.sort_values(['instrument', 'datetime']).reset_index(drop=True)
-    
+
     # 2. 确保每只股票都有 'label'（次日涨跌幅），否则无法作为 target
     data = data.dropna(subset=['label'])
-    
-    # 3. 为每只股票生成所有滑动窗口
-    # 仅保留满足以下条件的 end_date：
-    # - 历史窗口长度满足 sequence_length
-    # - end_date 之后存在 5 条未来数据
-    # - 这 5 条未来数据在自然日上连续（任意节假日/周末导致的日期跳跃都会被过滤）
-    all_windows = []  # 每个元素: (end_date, stock_code, sequence, target)
+
+    all_windows = []
 
     print("Step 1: 为每只股票生成滑动窗口...")
     grouped = data.groupby('instrument')
-    
+
     for stock_code, group in tqdm(grouped, desc="Processing stocks"):
         if len(group) < sequence_length:
             continue
-        
-        # 提取特征和 label
-        feature_values = group[features].values.astype(np.float32)  # (T, F)
-        labels = group['label'].values.astype(np.float32)           # (T,)
-        dates = group['datetime'].values                            # (T,)
-        dates_day = group['datetime'].values.astype('datetime64[D]')
 
-        # 生成滑动窗口：从第 sequence_length-1 行开始（0-indexed）
+        feature_values = group[features].values.astype(np.float32)
+        labels = group['label'].values.astype(np.float32)
+        dates = group['datetime'].values
+
         num_windows = len(group) - sequence_length + 1
         n = len(group)
+
         for i in range(num_windows):
             end_idx = i + sequence_length - 1
 
-            # 需要有未来 5 条数据
-            if end_idx + 5 >= n:
+            # 只需要保证当前行后面还有数据计算了 label 即可，
+            # pandas shift 已经对齐了交易日，千万不要用自然日去判断连续性！
+            if end_idx >= n:
                 continue
 
-            # 未来 5 条数据日期必须连续（自然日相邻）
-            future_dates = dates_day[end_idx + 1:end_idx + 6]
-            future_diffs = np.diff(future_dates).astype(np.int64)
-            if not np.all(future_diffs == 1):
-                continue
-
-            seq = feature_values[i : i + sequence_length]   # (L, F)
-            target = labels[end_idx]                        # label 对应窗口最后一天的次日涨跌幅
-            end_date = dates[end_idx]                       # 窗口结束日期（即预测日）
+            seq = feature_values[i: i + sequence_length]  # (L, F)
+            target = labels[end_idx]  # label 对应窗口最后一天的次日后5天收益
+            end_date = dates[end_idx]  # 窗口结束日期（即预测日）
             all_windows.append((end_date, stock_code, seq, target))
 
-    # 4. 转为 DataFrame 便于按日期聚合
     print("Step 2: 按日期聚合窗口...")
     window_df = pd.DataFrame(all_windows, columns=['date', 'stock_code', 'seq', 'target'])
 
-    # 5. 按 date 分组，构建每日样本
     sequences = []
     targets = []
     relevance_scores = []
@@ -602,20 +585,19 @@ def create_ranking_dataset_vectorized(data, features, sequence_length, ranking_d
 
     if min_window_end_date is not None:
         min_window_end_date = pd.to_datetime(min_window_end_date)
-    
+
     for date, group in tqdm(grouped_by_date, desc="Aggregating by date"):
         if min_window_end_date is not None and pd.to_datetime(date) < min_window_end_date:
             continue
 
         if len(group) < 10:
             continue
-        
-        # 提取数据
-        day_seqs = np.stack(group['seq'].values)          # (N, L, F)
-        day_targets = group['target'].values              # (N,)
-        day_stocks = group['stock_code'].tolist()         # [str]
 
-        # 计算 relevance（与原逻辑一致）
+        day_seqs = np.stack(group['seq'].values)
+        day_targets = group['target'].values
+        day_stocks = group['stock_code'].tolist()
+
+        # 计算 relevance (排名得分)
         sorted_indices = np.argsort(day_targets)[::-1]
         relevance = np.zeros_like(day_targets, dtype=np.float32)
         for rank, idx in enumerate(sorted_indices):
@@ -626,14 +608,17 @@ def create_ranking_dataset_vectorized(data, features, sequence_length, ranking_d
         relevance_scores.append(relevance)
         stock_indices.append(day_stocks)
 
-    print(f"成功创建 {len(sequences)} 个训练样本")
+    print(f"成功创建 {len(sequences)} 个每日交易样本")
     if len(sequences) > 0:
         avg_stocks = np.mean([len(seq) for seq in sequences])
         print(f"每个样本平均包含 {avg_stocks:.1f} 只股票")
 
-    # 6. 保存
-    # if ranking_data_path:
-    #     joblib.dump((sequences, targets, relevance_scores, stock_indices), ranking_data_path)
-    #     print(f"数据集已保存到: {ranking_data_path}")
+    # 比赛期间，为了防止读取到旧的错误缓存，暂时不保存 pkl，或者每次强制覆盖
+    if ranking_data_path:
+        # 确保目录存在
+        os.makedirs(os.path.dirname(ranking_data_path), exist_ok=True)
+        import joblib
+        joblib.dump((sequences, targets, relevance_scores, stock_indices), ranking_data_path)
+        print(f"数据集已保存到: {ranking_data_path}")
 
     return sequences, targets, relevance_scores, stock_indices

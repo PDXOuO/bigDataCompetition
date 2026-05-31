@@ -1,6 +1,25 @@
-__pycache__
+# 1. 忽略虚拟环境（体积最大）
+.venv/
+venv/
+.idea/
+
+# 2. 忽略比赛数据和缓存（比赛平台会自己挂载，绝对不能打包进镜像）
+data/
+temp/
+output/
+
+# 3. 忽略 Python 运行时的临时缓存文件
+__pycache__/
 *.pyc
-.git
-.venv
-.vscode
-.idea
+*.pyo
+*.pyd
+.Python
+.ipynb_checkpoints/
+
+# 4. 忽略 Git 版本控制文件
+.git/
+.gitignore
+
+# 5. 忽略之前可能导出的本地镜像压缩包
+*.tar
+*.tar.gz
