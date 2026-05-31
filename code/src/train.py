@@ -8,7 +8,6 @@ from tqdm import tqdm
 from tensorboardX import SummaryWriter
 from config import config
 from model import StockTransformer
-from model_lite import StockRankingNet, RankingLossWithLabelSmoothing
 from utils import engineer_features_39, engineer_features_158plus39
 from utils import create_ranking_dataset_vectorized
 import os
@@ -16,8 +15,6 @@ import json
 import multiprocessing as mp
 import random
 from torch.optim.swa_utils import AveragedModel, SWALR
-
-USE_LITE_MODEL = False  # 设置为 False 使用原来的 Transformer 模型
 
 
 def set_seed(seed=42):
@@ -710,28 +707,20 @@ def main():
         collate_fn=collate_fn, num_workers=0, pin_memory=False
     )
 
-    if USE_LITE_MODEL:
-        model = StockRankingNet(input_dim=len(features), config=config, num_stocks=num_stocks)
-        criterion = RankingLossWithLabelSmoothing(
-            k=5,
-            ic_weight=config.get('ic_weight', 4.0),
-            pairwise_weight=config.get('pairwise_weight', 1.5),
-            smoothing=config.get('label_smoothing', 0.15)
-        )
-    else:
-        model = StockTransformer(input_dim=len(features), config=config, num_stocks=num_stocks)
-        criterion = ImprovedRankingLoss(
-            k=5, temperature=0.5, weight_factor=config['top5_weight'],
-            pairwise_weight=config['pairwise_weight'], base_weight=config.get('base_weight', 1.0),
-            ic_weight=config.get('ic_weight', 2.0), ndcg_weight=1.0
-        )
+    model = StockTransformer(input_dim=len(features), config=config, num_stocks=num_stocks)
     model.to(device)
     print(f"模型参数量: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
+
+    criterion = ImprovedRankingLoss(
+        k=5, temperature=0.5, weight_factor=config.get('top5_weight', 15.0),
+        pairwise_weight=config.get('pairwise_weight', 2.0), base_weight=config.get('base_weight', 1.0),
+        ic_weight=config.get('ic_weight', 2.0), ndcg_weight=1.0
+    )
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config['learning_rate'],
-        weight_decay=config.get('weight_decay', 2e-4)
+        weight_decay=config.get('weight_decay', 5e-5)
     )
 
     warmup_epochs = config.get('warmup_epochs', 5)
@@ -749,7 +738,7 @@ def main():
 
             train_loss, train_metrics = train_ranking_model(
                 model, train_loader, criterion, optimizer, device, epoch, writer,
-                scheduler=None if epoch < warmup_epochs else None
+                scheduler=None if epoch >= warmup_epochs else scheduler
             )
 
             print(f"Train Loss: {train_loss:.4f}")
