@@ -2,14 +2,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import math
 
 
 class LearnablePositionalEncoding(nn.Module):
-    def __init__(self, d_model, dropout=0.1, max_len=5000):
+    """可学习的绝对位置编码"""
+
+    def __init__(self, d_model, max_len=5000, dropout=0.1):
         super().__init__()
-        self.pe = nn.Parameter(torch.randn(1, max_len, d_model) * 0.02)
         self.dropout = nn.Dropout(p=dropout)
+        self.pe = nn.Parameter(torch.randn(1, max_len, d_model) * 0.02)
 
     def forward(self, x):
         seq_len = x.size(1)
@@ -18,6 +19,8 @@ class LearnablePositionalEncoding(nn.Module):
 
 
 class TemporalCNNBlock(nn.Module):
+    """提取局部微观形态的 1D-CNN 残差块"""
+
     def __init__(self, d_model, kernel_size=3):
         super().__init__()
         padding = (kernel_size - 1) // 2
@@ -38,7 +41,70 @@ class TemporalCNNBlock(nn.Module):
         return self.activation(x + residual)
 
 
+class MultiScaleTemporalBlock(nn.Module):
+    """多尺度时间卷积，同时捕获不同时间尺度的形态特征"""
+
+    def __init__(self, d_model, dropout=0.1):
+        super().__init__()
+        branch_dim = d_model // 3
+        self.branch1 = nn.Sequential(
+            nn.Conv1d(d_model, branch_dim, kernel_size=3, padding=1),
+            nn.BatchNorm1d(branch_dim),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+        self.branch2 = nn.Sequential(
+            nn.Conv1d(d_model, branch_dim, kernel_size=5, padding=2),
+            nn.BatchNorm1d(branch_dim),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+        self.branch3 = nn.Sequential(
+            nn.Conv1d(d_model, d_model - 2 * branch_dim, kernel_size=7, padding=3),
+            nn.BatchNorm1d(d_model - 2 * branch_dim),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+        self.branch_dim = branch_dim
+        self.out_dim = d_model - 2 * branch_dim
+        self.fusion = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, x):
+        x_t = x.transpose(1, 2)
+        b1 = self.branch1(x_t)
+        b2 = self.branch2(x_t)
+        b3 = self.branch3(x_t)
+        merged = torch.cat([b1, b2, b3], dim=1)
+        merged = merged.transpose(1, 2)
+        return self.fusion(merged + x)
+
+
+class TemporalAttentionPooling(nn.Module):
+    """时间注意力池化 - 对60天序列加权聚合"""
+
+    def __init__(self, d_model, dropout=0.1):
+        super().__init__()
+        self.attention = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.Tanh(),
+            nn.Linear(d_model // 2, 1)
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        attn_weights = torch.softmax(self.attention(x), dim=1)
+        pooled = torch.sum(x * attn_weights, dim=1)
+        return self.dropout(pooled)
+
+
 class CrossStockAttention(nn.Module):
+    """增强的股票间注意力 - 模拟市场内股票之间的相互作用"""
+
     def __init__(self, d_model, nhead, dropout=0.1):
         super().__init__()
         self.d_model = d_model
@@ -85,22 +151,31 @@ class CrossStockAttention(nn.Module):
 
 
 class FeatureAttention(nn.Module):
+    """特征注意力模块 - 使用门控机制"""
+
     def __init__(self, d_model, dropout=0.1):
         super().__init__()
         self.attention = nn.Sequential(
-            nn.Linear(d_model, d_model),
+            nn.Linear(d_model, d_model // 2),
             nn.Tanh(),
-            nn.Linear(d_model, 1),
+            nn.Linear(d_model // 2, 1),
+        )
+        self.gate = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.Sigmoid()
         )
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         attention_weights = torch.softmax(self.attention(x), dim=1)
-        attended = torch.sum(x * attention_weights, dim=1)
+        gate_values = self.gate(x)
+        attended = torch.sum(x * attention_weights * gate_values, dim=1)
         return self.dropout(attended)
 
 
 class StockTransformer(nn.Module):
+    """股票排序Transformer - 结合多尺度时间特征和市场内股票交互"""
+
     def __init__(self, input_dim, config, num_stocks):
         super().__init__()
         self.model_type = 'RankingTransformer'
@@ -115,10 +190,10 @@ class StockTransformer(nn.Module):
         )
 
         self.pos_encoder = LearnablePositionalEncoding(
-            config['d_model'], config['dropout'], config['sequence_length']
+            config['d_model'], config['sequence_length'], config['dropout']
         )
 
-        self.temporal_cnn = TemporalCNNBlock(config['d_model'])
+        self.temporal_cnn = MultiScaleTemporalBlock(config['d_model'], config['dropout'])
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=config['d_model'],
@@ -130,6 +205,7 @@ class StockTransformer(nn.Module):
         )
         self.temporal_encoder = nn.TransformerEncoder(encoder_layer, num_layers=config['num_layers'])
 
+        self.temporal_pooling = TemporalAttentionPooling(config['d_model'], config['dropout'])
         self.feature_attention = FeatureAttention(config['d_model'], config['dropout'])
         self.cross_stock_attention = CrossStockAttention(config['d_model'], config['nhead'], config['dropout'])
 
@@ -172,9 +248,13 @@ class StockTransformer(nn.Module):
 
         temporal_features = self.temporal_encoder(cnn_features)
 
+        temporal_pooled = self.temporal_pooling(temporal_features)
+
         attended_features = self.feature_attention(temporal_features)
 
-        stock_features = attended_features.view(batch_size, num_stocks, -1)
+        pooled_features = (temporal_pooled + attended_features) / 2
+
+        stock_features = pooled_features.view(batch_size, num_stocks, -1)
 
         interactive_features = self.cross_stock_attention(stock_features, attn_mask=stock_adj_mask)
 
